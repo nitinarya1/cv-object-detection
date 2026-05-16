@@ -1,158 +1,92 @@
-"""
-evaluate.py  –  Model Evaluation Module
-Computes Precision, Recall, mAP@0.5 and mAP@0.5:0.95 for a trained YOLOv8 model.
-Usage:
-    python evaluate.py --model yolov8n.pt --data data.yaml
-"""
-
 import argparse
 import json
 import numpy as np
-from pathlib import Path
+import os
+
+def calc_iou(boxA, boxB):
+    # compute IoU
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    interArea = max(0, xB - xA) * max(0, yB - yA)
+    
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    
+    iou = interArea / float(boxAArea + boxBArea - interArea) if (boxAArea + boxBArea - interArea) > 0 else 0
+    return iou
 
 
-# ─── IoU Calculation ──────────────────────────────────────────────────────────
-def compute_iou(box_pred: np.ndarray, box_gt: np.ndarray) -> float:
-    """
-    Compute Intersection over Union (IoU) between two bounding boxes.
-    Boxes are in [x1, y1, x2, y2] format.
-    """
-    x1 = max(box_pred[0], box_gt[0])
-    y1 = max(box_pred[1], box_gt[1])
-    x2 = min(box_pred[2], box_gt[2])
-    y2 = min(box_pred[3], box_gt[3])
+def get_pr_curve(preds, gts, iou_thresh=0.5):
+    tp = 0
+    fp = 0
+    matched = []
 
-    intersection = max(0, x2 - x1) * max(0, y2 - y1)
-    area_pred = (box_pred[2] - box_pred[0]) * (box_pred[3] - box_pred[1])
-    area_gt   = (box_gt[2]   - box_gt[0])   * (box_gt[3]   - box_gt[1])
-    union = area_pred + area_gt - intersection
+    # sort predictions by confidence
+    preds = sorted(preds, key=lambda x: x.get("conf", 0), reverse=True)
 
-    return intersection / union if union > 0 else 0.0
-
-
-# ─── Precision & Recall ───────────────────────────────────────────────────────
-def compute_precision_recall(
-    predictions: list[dict],
-    ground_truths: list[dict],
-    iou_threshold: float = 0.5
-) -> tuple[float, float]:
-    """
-    Compute precision and recall given predictions and ground truths.
-
-    Each prediction / ground_truth dict should have keys:
-        - "box"   : [x1, y1, x2, y2]
-        - "class" : int
-        - "conf"  : float (predictions only)
-    """
-    tp = fp = fn = 0
-    matched_gt = set()
-
-    # Sort by confidence descending
-    preds_sorted = sorted(predictions, key=lambda x: x["conf"], reverse=True)
-
-    for pred in preds_sorted:
-        best_iou, best_idx = 0.0, -1
-        for idx, gt in enumerate(ground_truths):
-            if gt["class"] != pred["class"] or idx in matched_gt:
+    for p in preds:
+        best_iou = 0
+        best_gt_idx = -1
+        
+        for i, gt in enumerate(gts):
+            if gt["class"] != p["class"] or i in matched:
                 continue
-            iou = compute_iou(np.array(pred["box"]), np.array(gt["box"]))
+            
+            iou = calc_iou(p["box"], gt["box"])
             if iou > best_iou:
-                best_iou, best_idx = iou, idx
+                best_iou = iou
+                best_gt_idx = i
 
-        if best_iou >= iou_threshold and best_idx != -1:
+        if best_iou >= iou_thresh and best_gt_idx != -1:
             tp += 1
-            matched_gt.add(best_idx)
+            matched.append(best_gt_idx)
         else:
             fp += 1
 
-    fn = len(ground_truths) - len(matched_gt)
+    fn = len(gts) - len(matched)
 
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    return round(precision, 4), round(recall, 4)
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return prec, rec
 
 
-# ─── AP Calculation (via 11-point interpolation) ──────────────────────────────
-def compute_ap(precisions: list[float], recalls: list[float]) -> float:
-    """
-    Compute Average Precision using 11-point interpolation.
-    """
+def calculate_ap(precisions, recalls):
+    # 11 point AP
     ap = 0.0
-    for threshold in np.linspace(0, 1, 11):
-        prec_at_rec = [p for p, r in zip(precisions, recalls) if r >= threshold]
-        ap += max(prec_at_rec) if prec_at_rec else 0.0
-    return round(ap / 11, 4)
+    for t in np.linspace(0, 1, 11):
+        p_at_t = [p for p, r in zip(precisions, recalls) if r >= t]
+        ap += max(p_at_t) if p_at_t else 0.0
+    return ap / 11
 
 
-# ─── mAP over multiple IoU thresholds ─────────────────────────────────────────
-def compute_map(
-    predictions: list[dict],
-    ground_truths: list[dict],
-    iou_thresholds: list[float] = None
-) -> dict:
-    """
-    Compute mAP@0.5 and mAP@0.5:0.95 (COCO-style).
-    Returns a dict with 'mAP_50' and 'mAP_50_95'.
-    """
-    if iou_thresholds is None:
-        iou_thresholds = [round(t, 2) for t in np.arange(0.5, 1.0, 0.05)]
-
-    aps = []
-    for iou_thresh in iou_thresholds:
-        prec_list, rec_list = [], []
-        for conf_thresh in np.linspace(0.0, 1.0, 20):
-            filtered = [p for p in predictions if p["conf"] >= conf_thresh]
-            p, r = compute_precision_recall(filtered, ground_truths, iou_thresh)
-            prec_list.append(p)
-            rec_list.append(r)
-        aps.append(compute_ap(prec_list, rec_list))
-
-    map_50    = aps[0] if aps else 0.0
-    map_50_95 = round(np.mean(aps), 4) if aps else 0.0
-
-    return {"mAP_50": map_50, "mAP_50_95": map_50_95}
-
-
-# ─── Full Evaluation with YOLOv8 val ──────────────────────────────────────────
-def run_yolo_evaluation(model_path: str, data_yaml: str):
-    """
-    Run YOLOv8 model validation on a dataset. Requires ultralytics.
-    pip install ultralytics
-    """
+def run_eval(model_path, data_yaml):
     try:
         from ultralytics import YOLO
     except ImportError:
-        print("[ERROR] ultralytics not installed. Run: pip install ultralytics")
+        print("install ultralytics first")
         return
 
     model = YOLO(model_path)
-    metrics = model.val(data=data_yaml, verbose=True)
+    print("running validation...")
+    val_res = model.val(data=data_yaml, verbose=False)
 
-    print("\n" + "=" * 50)
-    print("  MODEL EVALUATION RESULTS")
-    print("=" * 50)
-    print(f"  Precision   : {metrics.results_dict.get('metrics/precision(B)', 0):.4f}")
-    print(f"  Recall      : {metrics.results_dict.get('metrics/recall(B)', 0):.4f}")
-    print(f"  mAP@0.5     : {metrics.results_dict.get('metrics/mAP50(B)', 0):.4f}")
-    print(f"  mAP@0.5:0.95: {metrics.results_dict.get('metrics/mAP50-95(B)', 0):.4f}")
-    print("=" * 50)
+    print("\n--- Evaluation Results ---")
+    print(f"Precision: {val_res.results_dict.get('metrics/precision(B)', 0):.4f}")
+    print(f"Recall: {val_res.results_dict.get('metrics/recall(B)', 0):.4f}")
+    print(f"mAP@50: {val_res.results_dict.get('metrics/mAP50(B)', 0):.4f}")
+    print(f"mAP@50-95: {val_res.results_dict.get('metrics/mAP50-95(B)', 0):.4f}")
+    
+    with open("results.json", "w") as f:
+        json.dump({k: float(v) for k, v in val_res.results_dict.items()}, f, indent=4)
+    print("saved results.json")
 
-    # Save results to JSON
-    results_path = Path("evaluation_results.json")
-    with open(results_path, "w") as f:
-        json.dump({k: float(v) for k, v in metrics.results_dict.items()}, f, indent=2)
-    print(f"[INFO] Results saved to {results_path}")
-
-    return metrics
-
-
-# ─── CLI Entry ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="YOLOv8 Model Evaluation")
-    parser.add_argument("--model", type=str, default="yolov8n.pt", help="Path to model weights")
-    parser.add_argument("--data",  type=str, default="data.yaml",  help="Path to dataset YAML")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--weights", type=str, default="yolov8n.pt")
+    parser.add_argument("--data", type=str, default="data.yaml")
     args = parser.parse_args()
 
-    print(f"[INFO] Evaluating model: {args.model}")
-    print(f"[INFO] Dataset config  : {args.data}")
-    run_yolo_evaluation(args.model, args.data)
+    run_eval(args.weights, args.data)

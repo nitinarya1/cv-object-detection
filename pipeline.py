@@ -1,163 +1,144 @@
 import cv2
 import numpy as np
-from pathlib import Path
+import os
 import time
+import sys
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-MODEL_WEIGHTS = "yolov8n.pt"   # or yolov8s.pt / yolov8m.pt
-CONFIDENCE_THRESHOLD = 0.40
-IOU_THRESHOLD = 0.45
+# config stuff
+MODEL_WEIGHTS = "yolov8n.pt"
+CONF_THRESH = 0.40
+IOU_THRESH = 0.45
 IMG_SIZE = 640
 
-# ─── Preprocessing Pipeline ───────────────────────────────────────────────────
-def preprocess_image(image_path: str, target_size: int = IMG_SIZE) -> np.ndarray:
-    """
-    Load and preprocess a single image for YOLOv8 inference.
-    Steps: read → resize (letterbox) → BGR→RGB → normalize → expand dims.
-    """
-    img = cv2.imread(image_path)
+def preprocess_image(img_path, target_size=IMG_SIZE):
+    # loads and resizes img for yolo
+    img = cv2.imread(img_path)
     if img is None:
-        raise FileNotFoundError(f"Image not found: {image_path}")
+        print(f"Error: Could not read image {img_path}")
+        return None
 
-    # Letterbox resize: maintain aspect ratio with padding
     h, w = img.shape[:2]
     scale = target_size / max(h, w)
-    new_w, new_h = int(w * scale), int(h * scale)
-    img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    nw, nh = int(w * scale), int(h * scale)
+    
+    img_res = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-    # Pad to square
-    pad_h = (target_size - new_h) // 2
-    pad_w = (target_size - new_w) // 2
-    img_padded = cv2.copyMakeBorder(
-        img_resized, pad_h, target_size - new_h - pad_h,
-        pad_w, target_size - new_w - pad_w,
+    # pad image
+    pad_h = (target_size - nh) // 2
+    pad_w = (target_size - nw) // 2
+    img_pad = cv2.copyMakeBorder(
+        img_res, pad_h, target_size - nh - pad_h,
+        pad_w, target_size - nw - pad_w,
         cv2.BORDER_CONSTANT, value=(114, 114, 114)
     )
 
-    img_rgb = cv2.cvtColor(img_padded, cv2.COLOR_BGR2RGB)
-    img_norm = img_rgb.astype(np.float32) / 255.0
-    return img_norm
+    # convert to rgb and normalize
+    img_rgb = cv2.cvtColor(img_pad, cv2.COLOR_BGR2RGB)
+    return img_rgb.astype(np.float32) / 255.0
 
 
-def augment_image(img: np.ndarray) -> list[np.ndarray]:
-    """
-    Apply basic augmentations: horizontal flip, brightness jitter, Gaussian noise.
-    Returns a list of augmented images.
-    """
-    augmented = [img]
+def augment_img(img):
+    # some basic augmentations
+    augs = [img]
 
-    # Horizontal flip
-    flipped = cv2.flip(img, 1)
-    augmented.append(flipped)
+    # flip
+    augs.append(cv2.flip(img, 1))
 
-    # Brightness jitter (±30%)
-    brightness_factor = np.random.uniform(0.7, 1.3)
-    bright = np.clip(img * brightness_factor, 0, 1.0).astype(np.float32)
-    augmented.append(bright)
+    # brightness
+    bf = np.random.uniform(0.7, 1.3)
+    augs.append(np.clip(img * bf, 0, 1.0).astype(np.float32))
 
-    # Gaussian noise
+    # noise
     noise = np.random.normal(0, 0.02, img.shape).astype(np.float32)
-    noisy = np.clip(img + noise, 0, 1.0).astype(np.float32)
-    augmented.append(noisy)
+    augs.append(np.clip(img + noise, 0, 1.0).astype(np.float32))
 
-    return augmented
+    return augs
 
 
-def preprocess_dataset(dataset_dir: str, output_dir: str, img_size: int = IMG_SIZE):
-    """
-    Process all images in dataset_dir: preprocess + augment and save to output_dir.
-    """
-    src = Path(dataset_dir)
-    dst = Path(output_dir)
-    dst.mkdir(parents=True, exist_ok=True)
+def process_dataset(src_dir, out_dir, img_size=IMG_SIZE):
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir)
 
-    image_extensions = {".jpg", ".jpeg", ".png", ".bmp"}
-    images = [f for f in src.rglob("*") if f.suffix.lower() in image_extensions]
-    print(f"[INFO] Found {len(images)} images in dataset.")
+    valid_exts = [".jpg", ".jpeg", ".png"]
+    images = []
+    for root, dirs, files in os.walk(src_dir):
+        for file in files:
+            if any(file.lower().endswith(ext) for ext in valid_exts):
+                images.append(os.path.join(root, file))
+                
+    print(f"Found {len(images)} images to process")
 
-    processed = 0
-    for img_path in images:
+    count = 0
+    for path in images:
         try:
-            img = preprocess_image(str(img_path), img_size)
-            augmented = augment_image(img)
-
-            for i, aug_img in enumerate(augmented):
-                out_name = f"{img_path.stem}_aug{i}.npy"
-                np.save(dst / out_name, aug_img)
-                processed += 1
+            img = preprocess_image(path, img_size)
+            if img is None: continue
+            
+            augs = augment_img(img)
+            fname = os.path.splitext(os.path.basename(path))[0]
+            
+            for i, aug_img in enumerate(augs):
+                out_name = f"{fname}_aug{i}.npy"
+                np.save(os.path.join(out_dir, out_name), aug_img)
+                count += 1
         except Exception as e:
-            print(f"[WARN] Skipped {img_path.name}: {e}")
+            print(f"failed on {path}: {e}")
 
-    print(f"[INFO] Preprocessed and saved {processed} arrays to '{output_dir}'.")
-    return processed
+    print(f"Done! Saved {count} processed images to {out_dir}")
+    return count
 
-
-# ─── Inference with YOLOv8 ────────────────────────────────────────────────────
-def run_inference(image_path: str, model_path: str = MODEL_WEIGHTS):
-    """
-    Run YOLOv8 inference on a single image. Requires ultralytics to be installed.
-    pip install ultralytics
-    """
+def run_prediction(img_path, model_path=MODEL_WEIGHTS):
+    # run inference
     try:
         from ultralytics import YOLO
     except ImportError:
-        print("[ERROR] ultralytics not installed. Run: pip install ultralytics")
+        print("Please install ultralytics: pip install ultralytics")
         return None
 
     model = YOLO(model_path)
-    results = model.predict(
-        source=image_path,
-        conf=CONFIDENCE_THRESHOLD,
-        iou=IOU_THRESHOLD,
+    res = model.predict(
+        source=img_path,
+        conf=CONF_THRESH,
+        iou=IOU_THRESH,
         imgsz=IMG_SIZE,
         verbose=False
     )
-    return results
+    return res
 
-
-def draw_detections(image_path: str, results) -> np.ndarray:
-    """
-    Draw bounding boxes and labels on the image.
-    """
-    img = cv2.imread(image_path)
-    for result in results:
-        for box in result.boxes:
+def draw_boxes(img_path, results):
+    img = cv2.imread(img_path)
+    for r in results:
+        for box in r.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cls_id = int(box.cls[0])
+            c = int(box.cls[0])
             conf = float(box.conf[0])
-            label = f"{result.names[cls_id]} {conf:.2f}"
-
-            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 200, 0), 2)
-            cv2.putText(img, label, (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 2)
+            
+            label = f"{r.names[c]} {conf:.2f}"
+            
+            # draw box and text
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(img, label, (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
     return img
 
-
-# ─── Main Demo ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-
     if len(sys.argv) < 2:
-        print("Usage: python pipeline.py <image_path_or_dataset_dir>")
-        print("Example: python pipeline.py images/sample.jpg")
-        sys.exit(0)
+        print("usage: python pipeline.py <img_path_or_dir>")
+        sys.exit(1)
 
-    input_path = Path(sys.argv[1])
+    path = sys.argv[1]
 
-    if input_path.is_dir():
-        # Batch preprocessing mode
-        preprocess_dataset(str(input_path), output_dir="processed_dataset")
+    if os.path.isdir(path):
+        process_dataset(path, "processed_data")
     else:
-        # Single image inference mode
-        print(f"[INFO] Running inference on: {input_path}")
-        start = time.time()
-        results = run_inference(str(input_path))
-        elapsed = time.time() - start
-
-        if results:
-            annotated = draw_detections(str(input_path), results)
-            out_path = f"output_{input_path.name}"
-            cv2.imwrite(out_path, annotated)
-            print(f"[INFO] Inference done in {elapsed:.2f}s → saved to '{out_path}'")
+        print(f"Running model on: {path}")
+        t0 = time.time()
+        res = run_prediction(path)
+        
+        if res:
+            img_out = draw_boxes(path, res)
+            out_name = "res_" + os.path.basename(path)
+            cv2.imwrite(out_name, img_out)
+            print(f"took {time.time() - t0:.2f}s, saved to {out_name}")
         else:
-            print("[ERROR] Inference failed.")
+            print("prediction failed")

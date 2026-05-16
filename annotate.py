@@ -1,169 +1,126 @@
-"""
-annotate.py  –  Dataset Annotation Helper
-A lightweight tool to annotate images with bounding boxes in YOLO format.
-Uses OpenCV for interactive annotation via mouse events.
-
-Controls:
-    Left-click + drag  → Draw bounding box
-    'c'                → Change class (0–9)
-    's'                → Save annotations for current image
-    'n'                → Next image
-    'q'                → Quit
-"""
-
 import cv2
-import numpy as np
-from pathlib import Path
+import os
 import json
 
-# ─── Annotation State ─────────────────────────────────────────────────────────
-annotations: list[dict] = []
+boxes = []
 drawing = False
-start_x = start_y = 0
-current_class = 0
-current_box: list = []
+ix, iy = -1, -1
+curr_cls = 0
 
-CLASS_NAMES = ["person", "car", "bicycle", "motorcycle", "truck",
-               "bus", "cat", "dog", "chair", "bottle"]
-COLORS = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
+classes = ["person", "car", "bike", "motorcycle", "truck", "bus", "cat", "dog", "chair", "bottle"]
+colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
           (0, 255, 255), (255, 0, 255), (128, 0, 128), (255, 165, 0),
           (0, 128, 128), (128, 128, 0)]
+curr_box = None
 
-
-def mouse_callback(event, x, y, flags, param):
-    global drawing, start_x, start_y, current_box
-
+def draw_rect(event, x, y, flags, param):
+    global ix, iy, drawing, curr_box, boxes
+    
     if event == cv2.EVENT_LBUTTONDOWN:
         drawing = True
-        start_x, start_y = x, y
-
-    elif event == cv2.EVENT_MOUSEMOVE and drawing:
-        current_box = [start_x, start_y, x, y]
-
+        ix, iy = x, y
+        
+    elif event == cv2.EVENT_MOUSEMOVE:
+        if drawing:
+            curr_box = [ix, iy, x, y]
+            
     elif event == cv2.EVENT_LBUTTONUP:
         drawing = False
-        x1, y1 = min(start_x, x), min(start_y, y)
-        x2, y2 = max(start_x, x), max(start_y, y)
-        if x2 - x1 > 5 and y2 - y1 > 5:
-            annotations.append({
-                "class": current_class,
-                "class_name": CLASS_NAMES[current_class],
-                "box": [x1, y1, x2, y2]
+        x1, x2 = min(ix, x), max(ix, x)
+        y1, y2 = min(iy, y), max(iy, y)
+        
+        if (x2 - x1) > 5 and (y2 - y1) > 5:
+            boxes.append({
+                "class_id": curr_cls,
+                "label": classes[curr_cls],
+                "bbox": [x1, y1, x2, y2]
             })
-            print(f"  Added: {CLASS_NAMES[current_class]} [{x1},{y1},{x2},{y2}]")
-        current_box = []
+            print(f"Added {classes[curr_cls]} at {x1},{y1},{x2},{y2}")
+        curr_box = None
 
-
-def convert_to_yolo(box: list, img_w: int, img_h: int) -> tuple:
-    """Convert [x1,y1,x2,y2] to YOLO normalized format (cx,cy,w,h)."""
+def normalize_box(box, w, h):
     x1, y1, x2, y2 = box
-    cx = (x1 + x2) / 2 / img_w
-    cy = (y1 + y2) / 2 / img_h
-    w  = (x2 - x1) / img_w
-    h  = (y2 - y1) / img_h
-    return round(cx, 6), round(cy, 6), round(w, 6), round(h, 6)
+    cx = (x1 + x2) / 2.0 / w
+    cy = (y1 + y2) / 2.0 / h
+    bw = (x2 - x1) / w
+    bh = (y2 - y1) / h
+    return cx, cy, bw, bh
 
+def save_data(img_path, shape, out_dir):
+    h, w = shape[:2]
+    base = os.path.basename(img_path).split('.')[0]
+    
+    # yolo format
+    lines = []
+    for b in boxes:
+        cx, cy, bw, bh = normalize_box(b["bbox"], w, h)
+        lines.append(f"{b['class_id']} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+        
+    txt_path = os.path.join(out_dir, f"{base}.txt")
+    with open(txt_path, 'w') as f:
+        f.write('\n'.join(lines))
+        
+    # json dump just in case
+    j_path = os.path.join(out_dir, f"{base}.json")
+    with open(j_path, 'w') as f:
+        json.dump({"img": img_path, "boxes": boxes}, f)
+        
+    print(f"Saved {len(boxes)} boxes for {base}")
 
-def save_annotations(image_path: str, img_shape: tuple, output_dir: Path):
-    """Save annotations to both YOLO .txt format and JSON format."""
-    img_h, img_w = img_shape[:2]
-    stem = Path(image_path).stem
-
-    # YOLO format .txt
-    yolo_lines = []
-    for ann in annotations:
-        cx, cy, w, h = convert_to_yolo(ann["box"], img_w, img_h)
-        yolo_lines.append(f"{ann['class']} {cx} {cy} {w} {h}")
-
-    txt_path = output_dir / f"{stem}.txt"
-    txt_path.write_text("\n".join(yolo_lines))
-
-    # JSON format (for easy inspection)
-    json_path = output_dir / f"{stem}.json"
-    with open(json_path, "w") as f:
-        json.dump({"image": str(image_path), "annotations": annotations}, f, indent=2)
-
-    print(f"[SAVED] {len(annotations)} annotations → {txt_path.name}, {json_path.name}")
-
-
-def annotate_dataset(image_dir: str, output_dir: str = "annotations"):
-    """
-    Interactively annotate all images in image_dir.
-    """
-    global annotations, current_class
-
-    src = Path(image_dir)
-    dst = Path(output_dir)
-    dst.mkdir(parents=True, exist_ok=True)
-
-    images = sorted([f for f in src.rglob("*")
-                     if f.suffix.lower() in {".jpg", ".jpeg", ".png"}])
-
-    if not images:
-        print(f"[ERROR] No images found in '{image_dir}'")
+def start_annotating(img_folder, out_folder="labels"):
+    global boxes, curr_cls, curr_box
+    
+    if not os.path.exists(out_folder):
+        os.makedirs(out_folder)
+        
+    valid = [".jpg", ".png", ".jpeg"]
+    imgs = [os.path.join(img_folder, f) for f in os.listdir(img_folder) if any(f.endswith(e) for e in valid)]
+    
+    if len(imgs) == 0:
+        print("No images found!")
         return
-
-    print(f"[INFO] {len(images)} images to annotate.")
-    print("[INFO] Controls: drag=draw box | 'c'=change class | 's'=save | 'n'=next | 'q'=quit")
-
-    cv2.namedWindow("Annotator", cv2.WINDOW_NORMAL)
-    cv2.setMouseCallback("Annotator", mouse_callback)
-
-    for img_path in images:
-        annotations = []
-        img = cv2.imread(str(img_path))
-        if img is None:
-            continue
-
-        print(f"\n[IMAGE] {img_path.name}  (class: {CLASS_NAMES[current_class]})")
-
+        
+    cv2.namedWindow('annotate')
+    cv2.setMouseCallback('annotate', draw_rect)
+    
+    print(f"Found {len(imgs)} images. c: change class, s: save/next, q: quit")
+    
+    for path in imgs:
+        boxes = []
+        img = cv2.imread(path)
+        if img is None: continue
+        
         while True:
-            display = img.copy()
-
-            # Draw existing annotations
-            for ann in annotations:
-                x1, y1, x2, y2 = ann["box"]
-                color = COLORS[ann["class"]]
-                cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(display, ann["class_name"], (x1, y1 - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-            # Draw live box
-            if current_box:
-                cv2.rectangle(display, (current_box[0], current_box[1]),
-                              (current_box[2], current_box[3]),
-                              COLORS[current_class], 2)
-
-            # HUD
-            hud = f"Class: {CLASS_NAMES[current_class]} ({current_class}) | Boxes: {len(annotations)}"
-            cv2.putText(display, hud, (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            cv2.imshow("Annotator", display)
-            key = cv2.waitKey(20) & 0xFF
-
-            if key == ord('c'):
-                current_class = (current_class + 1) % len(CLASS_NAMES)
-                print(f"  Class → {CLASS_NAMES[current_class]}")
-            elif key == ord('s'):
-                save_annotations(str(img_path), img.shape, dst)
-            elif key == ord('n') or key == ord('s'):
-                save_annotations(str(img_path), img.shape, dst)
+            temp = img.copy()
+            
+            for b in boxes:
+                x1, y1, x2, y2 = b["bbox"]
+                col = colors[b["class_id"]]
+                cv2.rectangle(temp, (x1, y1), (x2, y2), col, 2)
+                cv2.putText(temp, b["label"], (x1, y1-5), cv2.FONT_HERSHEY_PLAIN, 1, col, 1)
+                
+            if curr_box:
+                cv2.rectangle(temp, (curr_box[0], curr_box[1]), (curr_box[2], curr_box[3]), colors[curr_cls], 2)
+                
+            cv2.putText(temp, f"Class: {classes[curr_cls]} ({curr_cls})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+            
+            cv2.imshow('annotate', temp)
+            k = cv2.waitKey(20) & 0xFF
+            
+            if k == ord('c'):
+                curr_cls = (curr_cls + 1) % len(classes)
+            elif k == ord('s'):
+                save_data(path, img.shape, out_folder)
                 break
-            elif key == ord('q'):
+            elif k == ord('q'):
                 cv2.destroyAllWindows()
                 return
 
     cv2.destroyAllWindows()
-    print("\n[DONE] Annotation session complete.")
-
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python annotate.py <image_directory> [output_directory]")
-        print("Example: python annotate.py ./images ./annotations")
+        print("Usage: python annotate.py <img_dir>")
     else:
-        img_dir  = sys.argv[1]
-        out_dir  = sys.argv[2] if len(sys.argv) > 2 else "annotations"
-        annotate_dataset(img_dir, out_dir)
+        start_annotating(sys.argv[1])
