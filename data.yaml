@@ -1,0 +1,21 @@
+# Example dataset configuration for YOLOv8
+# Replace the paths with your actual dataset paths
+
+path: ./dataset          # Root dataset directory
+train: images/train      # Train images (relative to 'path')
+val: images/val          # Validation images
+test: images/test        # Test images (optional)
+
+# Class definitions
+nc: 10                   # Number of classes
+names:
+  0: person
+  1: car
+  2: bicycle
+  3: motorcycle
+  4: truck
+  5: bus
+  6: cat
+  7: dog
+  8: chair
+  9: bottle
